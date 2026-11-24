@@ -1,18 +1,21 @@
 name: CI
 
-# Every change to the cask: lint it, then install it from this tap on a real Mac,
-# launch the app, and zap it to nothing.
+# The gate for every cask change. Soul Player's release workflow opens a PR here
+# (with its GitHub App token, so this runs), and the PR only merges when
+# `cask-ci` passes: lint, audit, livecheck, then install from this tap on a real
+# Mac, check it's the right version and quarantined as users get it, launch it,
+# and zap it to nothing.
 on:
+  pull_request:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  cask:
+  cask-ci:
     runs-on: macos-15
     timeout-minutes: 20
     env:
@@ -24,22 +27,27 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Use this checkout as the soulaudio/tap tap
+      - name: This checkout as soulaudio/tap
         run: |
           set -euo pipefail
-          if [ ! -f Casks/soul-player.rb ]; then
-            echo "::notice::no cask yet: the release workflow publishes it"; exit 0
-          fi
+          if [ ! -f Casks/soul-player.rb ]; then echo "::notice::no cask to test"; exit 0; fi
           tap="$(brew --repository)/Library/Taps/soulaudio/homebrew-tap"
           mkdir -p "$(dirname "$tap")" && rm -rf "$tap" && cp -R "$PWD" "$tap"
-          if brew trust --help >/dev/null 2>&1; then brew trust soulaudio/tap; fi
+          brew trust soulaudio/tap   # Homebrew 6+: third-party taps must be trusted
           echo "CASK=1" >> "$GITHUB_ENV"
+          echo "VERSION=$(sed -nE 's/^  version "([^"]+)"/\1/p' Casks/soul-player.rb)" >> "$GITHUB_ENV"
 
-      - name: brew style + audit
+      # Not `--new`: that turns on the Gatekeeper check, which an app that isn't
+      # notarized yet fails by design.
+      - name: brew style + audit + livecheck
         if: env.CASK == '1'
         run: |
+          set -euo pipefail
           brew style --cask soulaudio/tap/soul-player
           brew audit --cask --strict --online soulaudio/tap/soul-player
+          seen=$(brew livecheck --cask --json soulaudio/tap/soul-player | jq -r '.[0].version.latest')
+          echo "livecheck sees $seen, cask is $VERSION"
+          [ "$seen" = "$VERSION" ] || { echo "::error::livecheck reports $seen, the cask says $VERSION"; exit 1; }
 
       - name: Install, launch, zap
         if: env.CASK == '1'
@@ -47,9 +55,12 @@ jobs:
           set -euo pipefail
           brew install --cask soulaudio/tap/soul-player
           app="/Applications/Soul Player.app"
-          test -d "$app"
-          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
-          echo "installed $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist"): $(lipo -archs "$exe")"
+          plist="$app/Contents/Info.plist"
+          v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")
+          [ "$v" = "$VERSION" ] || { echo "::error::installed $v, the cask says $VERSION"; exit 1; }
+          xattr "$app" | grep -q com.apple.quarantine \
+            || { echo "::error::not quarantined: users would get a different app"; exit 1; }
+          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
           xattr -dr com.apple.quarantine "$app"   # what "Open Anyway" does until notarization
           SOUL_PLAYER_NO_UPDATE=1 "$exe" & pid=$!
           sleep 10
@@ -61,4 +72,4 @@ jobs:
           for d in "$HOME/Library/Application Support/soul-player" "$HOME/Library/Logs/Soul Player" "$HOME/Library/Caches/soul-player"; do
             test ! -e "$d" || { echo "::error::zap left $d"; exit 1; }
           done
-          echo "ok: installed, launched, zapped to nothing"
+          echo "ok: soul-player $VERSION installs from this tap (quarantined), launches, zaps to nothing"
