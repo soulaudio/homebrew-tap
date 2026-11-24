@@ -1,0 +1,64 @@
+name: CI
+
+# Every change to the cask: lint it, then install it from this tap on a real Mac,
+# launch the app, and zap it to nothing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cask:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Use this checkout as the soulaudio/tap tap
+        run: |
+          set -euo pipefail
+          if [ ! -f Casks/soul-player.rb ]; then
+            echo "::notice::no cask yet: the release workflow publishes it"; exit 0
+          fi
+          tap="$(brew --repository)/Library/Taps/soulaudio/homebrew-tap"
+          mkdir -p "$(dirname "$tap")" && rm -rf "$tap" && cp -R "$PWD" "$tap"
+          if brew trust --help >/dev/null 2>&1; then brew trust soulaudio/tap; fi
+          echo "CASK=1" >> "$GITHUB_ENV"
+
+      - name: brew style + audit
+        if: env.CASK == '1'
+        run: |
+          brew style --cask soulaudio/tap/soul-player
+          brew audit --cask --strict --online soulaudio/tap/soul-player
+
+      - name: Install, launch, zap
+        if: env.CASK == '1'
+        run: |
+          set -euo pipefail
+          brew install --cask soulaudio/tap/soul-player
+          app="/Applications/Soul Player.app"
+          test -d "$app"
+          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          echo "installed $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist"): $(lipo -archs "$exe")"
+          xattr -dr com.apple.quarantine "$app"   # what "Open Anyway" does until notarization
+          SOUL_PLAYER_NO_UPDATE=1 "$exe" & pid=$!
+          sleep 10
+          kill -0 "$pid" || { echo "::error::the app exited at launch"; exit 1; }
+          kill -TERM "$pid"; wait "$pid" || true
+          test -d "$HOME/Library/Logs/Soul Player"   # it ran and wrote its log
+          brew uninstall --cask --zap soulaudio/tap/soul-player
+          test ! -e "$app"
+          for d in "$HOME/Library/Application Support/soul-player" "$HOME/Library/Logs/Soul Player" "$HOME/Library/Caches/soul-player"; do
+            test ! -e "$d" || { echo "::error::zap left $d"; exit 1; }
+          done
+          echo "ok: installed, launched, zapped to nothing"
