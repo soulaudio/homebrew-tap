@@ -1,0 +1,134 @@
+name: Update cask
+
+# Follows Soul Player releases: when github.com/soulaudio/soul-player-ng has a
+# newer published release than Casks/soul-player.rb, regenerate the cask with that
+# release's own gen-cask.py, install + launch + zap it on a real Mac, and only
+# then commit it. Pull-based on purpose: no token from the app repo can write
+# here, and nothing here can write there.
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: update-cask
+  cancel-in-progress: false
+
+env:
+  REPO: soulaudio/soul-player-ng
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      new: ${{ steps.v.outputs.new }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: v
+        run: |
+          set -euo pipefail
+          latest=$(curl -fsSL "https://github.com/$REPO/releases/latest/download/latest.json" | jq -r .version)
+          have=$(sed -nE 's/^  version "([^"]+)"/\1/p' Casks/soul-player.rb 2>/dev/null || true)
+          echo "latest release $latest, cask ${have:-none}"
+          newer=$(printf '%s\n%s\n' "${have:-0.0.0}" "$latest" | sort -V | tail -1)
+          if [ "$latest" != "${have:-}" ] && [ "$newer" = "$latest" ]; then new=true; else new=false; fi
+          echo "version=$latest" >> "$GITHUB_OUTPUT"
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+
+      - name: Generate the cask
+        if: steps.v.outputs.new == 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/$REPO/releases/download/v$VERSION"
+          dmg="Soul-Player_${VERSION}_universal.dmg"
+          sha=$(curl -fsSL "$base/SHA256SUMS" | awk -v f="$dmg" '$2 == f { print $1 }')
+          [ -n "$sha" ] || { echo "::error::no $dmg in v$VERSION's SHA256SUMS"; exit 1; }
+          curl -fsSL "https://raw.githubusercontent.com/$REPO/v$VERSION/.github/scripts/gen-cask.py" -o gen-cask.py
+          python3 gen-cask.py --selftest
+          mkdir -p out && python3 gen-cask.py --version "$VERSION" --sha256 "$sha" --out out/soul-player.rb
+          cat out/soul-player.rb
+
+      - if: steps.v.outputs.new == 'true'
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: cask
+          path: out/soul-player.rb
+
+  test:
+    needs: check
+    if: needs.check.outputs.new == 'true'
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_FROM_API: "1"
+      HOMEBREW_NO_ANALYTICS: "1"
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: cask
+          path: Casks
+      - name: Install, launch, zap (the published DMG, from this tap)
+        run: |
+          set -euo pipefail
+          tap="$(brew --repository)/Library/Taps/soulaudio/homebrew-tap"
+          mkdir -p "$(dirname "$tap")" && rm -rf "$tap" && cp -R "$PWD" "$tap"
+          if brew trust --help >/dev/null 2>&1; then brew trust soulaudio/tap; fi
+          brew style --cask soulaudio/tap/soul-player
+          brew audit --cask --strict --online soulaudio/tap/soul-player
+          brew install --cask soulaudio/tap/soul-player
+          app="/Applications/Soul Player.app"
+          v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")
+          [ "$v" = "${{ needs.check.outputs.version }}" ] || { echo "::error::installed $v"; exit 1; }
+          exe="$app/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")"
+          xattr -dr com.apple.quarantine "$app"   # what "Open Anyway" does until notarization
+          SOUL_PLAYER_NO_UPDATE=1 "$exe" & pid=$!
+          sleep 10
+          kill -0 "$pid" || { echo "::error::the app exited at launch"; exit 1; }
+          kill -TERM "$pid"; wait "$pid" || true
+          test -d "$HOME/Library/Logs/Soul Player"
+          brew uninstall --cask --zap soulaudio/tap/soul-player
+          test ! -e "$app"
+          for d in "$HOME/Library/Application Support/soul-player" "$HOME/Library/Logs/Soul Player" "$HOME/Library/Caches/soul-player"; do
+            test ! -e "$d" || { echo "::error::zap left $d"; exit 1; }
+          done
+          echo "ok: soul-player $v installs from this tap, launches, and zaps to nothing"
+
+  publish:
+    needs: [check, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v4.3.0
+        with:
+          name: cask
+          path: Casks
+      - name: Commit
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          set -euo pipefail
+          rm -f Casks/.gitkeep
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A Casks
+          git diff --cached --quiet && { echo "cask already at $VERSION"; exit 0; }
+          git commit -q -m "soul-player $VERSION"
+          git push -q origin HEAD:main
+          echo "Published the soul-player $VERSION cask" >> "$GITHUB_STEP_SUMMARY"
