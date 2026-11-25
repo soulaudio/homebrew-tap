@@ -47,10 +47,16 @@ jobs:
         run: |
           set -euo pipefail
           brew style --cask soulaudio/tap/soul-player
-          brew audit --cask --strict --online soulaudio/tap/soul-player
+          # livecheck_version demands the newest release, which would block a
+          # rollback PR (an older version on purpose). Checked below instead:
+          # livecheck must work, and the cask must not be ahead of the releases.
+          brew audit --cask --strict --online --except livecheck_version soulaudio/tap/soul-player
           seen=$(brew livecheck --cask --json soulaudio/tap/soul-player | jq -r '.[0].version.latest')
           echo "livecheck sees $seen, cask is $VERSION"
-          [ "$seen" = "$VERSION" ] || { echo "::error::livecheck reports $seen, the cask says $VERSION"; exit 1; }
+          [ -n "$seen" ] && [ "$seen" != null ] || { echo "::error::livecheck found no version"; exit 1; }
+          newest=$(printf '%s\n%s\n' "$seen" "$VERSION" | sort -V | tail -1)
+          [ "$newest" = "$seen" ] || { echo "::error::the cask says $VERSION, ahead of the newest release $seen"; exit 1; }
+          [ "$seen" = "$VERSION" ] || echo "::notice::the cask is at $VERSION, behind the newest release $seen (a rollback)"
 
       - name: Install, launch, zap
         if: env.CASK == '1'
