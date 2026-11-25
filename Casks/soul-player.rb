@@ -1,6 +1,6 @@
 cask "soul-player" do
-  version "0.4.6"
-  sha256 "77b1cb623dc421040ce5467d661c9594dd5f1f275b87349e7af9fc4fdf0a2cd8"
+  version "0.4.7"
+  sha256 "a48e4375f7b7528ffce64ef7d0deecc7f424d9791e9bbd44731ed0da618157f9"
 
   url "https://github.com/soulaudio/soul-player-ng/releases/download/v#{version}/Soul-Player_#{version}_universal.dmg"
   name "Soul Player"
