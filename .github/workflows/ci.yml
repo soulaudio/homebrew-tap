@@ -7,8 +7,11 @@ name: CI
 # and zap it to nothing.
 on:
   pull_request:
+  # main: the tap as users get it, checked after every merge (the release
+  # workflow waits for this before calling a publish done). drill/**: the
+  # release workflow's throwaway rehearsal branches, checked the same way.
   push:
-    branches: [main]
+    branches: [main, "drill/**"]
   workflow_dispatch:
 
 permissions:
